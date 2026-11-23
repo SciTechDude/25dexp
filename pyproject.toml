@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tabletop"
+version = "0.1.0"
+description = "A top-down arcade game that tries to look 2.5D"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "ursina>=7.0",
+]
+
+[project.optional-dependencies]
+# Only needed to read a touchscreen on Linux; macOS has no equivalent.
+linux = ["evdev>=1.7"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+# Explicit, because flat-layout auto-discovery also finds `assets/` (it holds
+# a sprite script) and the generated `renders/`, and then refuses to build.
+include = ["tabletop*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+    "ursina: needs a real graphics context; slow, and creates a window",
+]

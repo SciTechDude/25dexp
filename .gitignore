@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+
+# Generated renders. Reproduce with: ./run.sh capture
+renders/
+
+# macOS
+.DS_Store
