@@ -416,6 +416,26 @@ def pop_shade_alpha(
     return POP_SHADE_ALPHA * (1.0 - clamp(height, 0.0, 1.0))
 
 
+def turn_frame(signed_width: float, frame_widths=None) -> int:
+    """Which frame of the turn strip shows the mole at this signed width.
+
+    ``signed_width`` is +1 for a mole at full width facing the way the
+    artwork does, -1 for full width mirrored, and 0 for edge-on. The
+    frames are baked at a fixed ladder of those values (see
+    :data:`~tabletop.render.assets.MOLE_TURN_FRAME_WIDTHS`), so this is a
+    nearest-neighbour pick over that ladder.
+
+    Picking a frame is what replaced mirroring the card. Mirroring is one
+    multiply and looks it: the painted mound mirrored along with the mole,
+    so the earth jumped sides whenever the mole turned, and the turn's
+    squeeze flattened the dirt too.
+    """
+    widths = assets.MOLE_TURN_FRAME_WIDTHS if frame_widths is None else frame_widths
+    return min(
+        range(len(widths)), key=lambda i: abs(widths[i] - signed_width)
+    )
+
+
 def turn_restart_s(remaining_s: float, duration_s: float) -> float:
     """Time to put on the clock when a mole turns. Handles turning twice.
 
@@ -613,7 +633,15 @@ class WhackAMoleView(Entity):
                 orient_outward=False,
             )
 
-        mole_sprite = assets.load(assets.MOLE_SPRITE)
+        # The strip carries the mole *and* a fixed mound per frame; the
+        # single sheet is kept as a fallback so a missing bake degrades to
+        # the old mirrored card rather than to no mole at all.
+        mole_sprite = assets.load(assets.MOLE_TURN_STRIP)
+        self.turn_frames = len(assets.MOLE_TURN_FRAME_WIDTHS)
+        self.use_turn_strip = mole_sprite is not None
+        if mole_sprite is None:
+            mole_sprite = assets.load(assets.MOLE_SPRITE)
+            self.turn_frames = 1
         self.use_sprite = mole_sprite is not None
         gradient_span = mm_to_world(cfg.hole_depth_mm)
         self.card_width_mm = self._card_width_mm()
@@ -634,7 +662,8 @@ class WhackAMoleView(Entity):
                 # procedural body, ears, snout or paws are needed -- and the
                 # painted mound is what hides the seam where the card passes
                 # through the hole.
-                aspect = mole_sprite.height / mole_sprite.width
+                frame_width_px = mole_sprite.width / self.turn_frames
+                aspect = mole_sprite.height / frame_width_px
                 card_height_mm = self.card_width_mm * aspect
                 # Kept as the base for the impact squash. Reading the
                 # entity's current scale back each frame would compound the
@@ -658,6 +687,12 @@ class WhackAMoleView(Entity):
                     shader=UNLIT_120,
                     double_sided=True,
                 )
+                if self.use_turn_strip:
+                    # One frame of the strip fills the card; which one is
+                    # chosen per frame by texture_offset.
+                    mole.set_shader_input(
+                        "texture_scale", Vec2(1.0 / self.turn_frames, 1.0)
+                    )
                 apply_theme_to(mole, self.theme, "creature", textured=True)
             else:
                 mole = Entity(
@@ -1322,15 +1357,27 @@ class WhackAMoleView(Entity):
                 # Negative X scale mirrors the card horizontally.
                 width = abs(self._card_scale[0]) * (1.0 + 0.35 * squash)
                 height_scale = self._card_scale[1] * (1.0 - 0.30 * squash)
-                facing = -width if self._mirror_for(hole) else width
-                # Mid-turn the card is spinning about its own vertical axis,
-                # so the width it presents is the new facing's, narrowed and
+                # Mid-turn the mole is spinning about its own vertical
+                # axis, so it presents the new facing's width, narrowed and
                 # briefly reversed. `hole.faces_right` has already changed
                 # by the time the event arrives, which is why the factor
                 # starts at -1.
-                mole.scale_x = facing * turn_spin_factor(
+                spin = turn_spin_factor(
                     self.turn_left_s[hole.index], self.turn_span_s[hole.index]
                 )
+                signed = (-1.0 if self._mirror_for(hole) else 1.0) * spin
+                if self.use_turn_strip:
+                    # The card keeps its full width and the *frame* carries
+                    # the turn, so the mound baked into every frame stays
+                    # exactly where it is.
+                    frame = turn_frame(signed)
+                    mole.set_shader_input(
+                        "texture_offset",
+                        Vec2(frame / self.turn_frames, 0.0),
+                    )
+                    mole.scale_x = width
+                else:
+                    mole.scale_x = signed * width
                 mole.scale_y = height_scale
             else:
                 # Lean backward, away from the player, so the face comes up

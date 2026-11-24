@@ -13,5 +13,10 @@ venv/
 # Generated renders. Reproduce with: ./run.sh capture
 renders/
 
+# Contact sheet for the baked mole strip -- an eyeballing aid, not an
+# asset. Reproduce with:
+#   python tools/bake_mole_turn_strip.py --preview
+assets/mole_turn_preview.png
+
 # macOS
 .DS_Store

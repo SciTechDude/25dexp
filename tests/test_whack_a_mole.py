@@ -1108,3 +1108,293 @@ class TestPopShade:
         from tabletop.apps.whack_a_mole import pop_shade_alpha
 
         assert pop_shade_alpha(False, 0.0, 0.05, 0.0) >= 0.0
+
+
+class TestTurnFrames:
+    """Turning by picking a frame, instead of mirroring the card.
+
+    The artwork paints the mole and its dirt mound on one sheet, so
+    mirroring the card to face the mole the other way mirrored the earth
+    with it -- the mound jumped sides -- and the turn's squeeze flattened
+    the dirt along with the animal. The strip bakes the pair together per
+    frame, so the mound is the same pixels throughout and cannot move.
+    """
+
+    def test_full_width_picks_the_end_frames(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_frame
+        from tabletop.render.assets import MOLE_TURN_FRAME_WIDTHS as widths
+
+        assert turn_frame(1.0) == 0
+        assert turn_frame(-1.0) == len(widths) - 1
+
+    def test_edge_on_picks_the_middle_frame(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_frame
+        from tabletop.render.assets import MOLE_TURN_FRAME_WIDTHS as widths
+
+        assert turn_frame(0.0) == len(widths) // 2
+
+    def test_the_frame_follows_the_spin_monotonically(self) -> None:
+        """Sweeping a turn walks the strip one way, never back and forth."""
+        from tabletop.apps.whack_a_mole import turn_frame
+
+        frames = [turn_frame(1.0 - 2.0 * i / 40) for i in range(41)]
+        assert frames == sorted(frames)
+        assert frames[0] == 0
+        assert frames[-1] == len(set(frames)) - 1
+
+    def test_every_frame_is_reachable(self) -> None:
+        """A frame no signed width selects is a frame baked for nothing."""
+        from tabletop.apps.whack_a_mole import turn_frame
+        from tabletop.render.assets import MOLE_TURN_FRAME_WIDTHS as widths
+
+        picked = {turn_frame(1.0 - 2.0 * i / 200) for i in range(201)}
+        assert picked == set(range(len(widths)))
+
+    def test_the_ladder_is_symmetric(self) -> None:
+        """The two rest poses have to be equal and opposite, or the mole
+        ends a turn narrower than it started."""
+        from tabletop.render.assets import MOLE_TURN_FRAME_WIDTHS as widths
+
+        assert widths[0] == 1.0
+        assert widths[-1] == -1.0
+        assert [-x for x in reversed(widths)] == list(widths)
+
+
+class TestTurnStripAsset:
+    """The baked strip itself. Needs Pillow, which the dev extra brings in."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def frames(cls):
+        np = pytest.importorskip("numpy")
+        Image = pytest.importorskip("PIL.Image")
+        from tabletop.render import assets
+
+        path = assets.ASSETS_DIR / assets.MOLE_TURN_STRIP
+        if not path.is_file():
+            pytest.skip("turn strip not baked")
+        strip = np.asarray(Image.open(path).convert("RGBA"))
+        count = len(assets.MOLE_TURN_FRAME_WIDTHS)
+        assert strip.shape[1] % count == 0, "strip is not a whole number of frames"
+        w = strip.shape[1] // count
+        return [strip[:, i * w : (i + 1) * w] for i in range(count)]
+
+    def test_the_mound_is_identical_in_every_frame(self, frames) -> None:
+        """The whole point. A band near the bottom is mound only -- the
+        mole's lowest claw is well above it -- so if the dirt ever moves or
+        mirrors, these rows stop matching.
+        """
+        import numpy as np
+
+        h = frames[0].shape[0]
+        band = slice(int(h * 0.88), h)
+        first = frames[0][band]
+        for i, frame in enumerate(frames[1:], start=1):
+            assert np.array_equal(frame[band], first), f"frame {i} moved the mound"
+
+    def test_the_mound_band_is_not_symmetric(self, frames) -> None:
+        """Teeth for the test above: a left-right symmetric mound would
+        survive being mirrored, and prove nothing."""
+        import numpy as np
+
+        h = frames[0].shape[0]
+        band = frames[0][int(h * 0.88) : h]
+        assert not np.array_equal(band, band[:, ::-1])
+
+    def test_the_mole_does_change_between_frames(self, frames) -> None:
+        """Otherwise the strip is seven copies of one pose."""
+        import numpy as np
+
+        assert not np.array_equal(frames[0], frames[-1])
+        # The end frames face opposite ways, so one is roughly the mirror
+        # of the other where the mole is.
+        assert np.array_equal(frames[0].shape, frames[-1].shape)
+
+    def test_the_edge_on_frame_has_no_mole(self, frames) -> None:
+        """At zero width a card with no thickness shows nothing, so that
+        frame is the mound alone -- which is also what makes it the
+        reference for the mound's own pixels."""
+        from tabletop.render.assets import MOLE_TURN_FRAME_WIDTHS as widths
+
+        middle = frames[len(widths) // 2]
+        # The mole's own colours: blue-grey body and peach muzzle.
+        rgb = middle[..., :3].astype(int)
+        opaque = middle[..., 3] > 128
+        bluish = opaque & (rgb[..., 2] > rgb[..., 0] + 15)
+        assert bluish.mean() < 0.005, "mole body left in the edge-on frame"
+
+    def test_the_mound_encloses_no_transparent_pockets(self, frames) -> None:
+        """Holes in the dirt only show once the mole turns away from them.
+
+        Colour separation left the tips of both claws as transparent
+        pockets in the mound -- a few dozen pixels each, hidden behind the
+        mole in the pose it was drawn in, and a pair of pale specks in the
+        dirt in every other frame. A pocket is transparency unreachable
+        from the border, which is what distinguishes it from the sky.
+        """
+        import numpy as np
+
+        for i, frame in enumerate(frames):
+            holes = frame[..., 3] <= 128
+            reach = np.zeros_like(holes)
+            front = np.zeros_like(holes)
+            front[0, :] = front[-1, :] = True
+            front[:, 0] = front[:, -1] = True
+            front &= holes
+            while front.any():
+                reach |= front
+                grow = np.zeros_like(front)
+                grow[1:, :] |= front[:-1, :]
+                grow[:-1, :] |= front[1:, :]
+                grow[:, 1:] |= front[:, :-1]
+                grow[:, :-1] |= front[:, 1:]
+                front = grow & holes & ~reach
+            pockets = int((holes & ~reach).sum())
+            assert pockets == 0, f"frame {i} has {pockets} px of holes in the dirt"
+
+    def test_no_pale_specks_in_the_dirt(self, frames) -> None:
+        """Page white must not survive into the mound.
+
+        Two ways it got there, and both showed as light specks in the dirt
+        once the mole turned off them: flecks the separation took as mud,
+        and -- less obviously -- donor pixels that the scrub had emptied
+        but whose RGB was still white, copied into the rebuild as opaque
+        white.
+
+        Measured on the edge-on frame, which is the mound with no mole on
+        it, and on the mound-only band of every other frame. Not on a
+        whole frame: the mole's eye is legitimately white, and a test that
+        banned pale pixels outright would demand it be painted out.
+        """
+        mound = frames[len(frames) // 2]
+        h = mound.shape[0]
+        regions = [("edge-on frame", mound)] + [
+            (f"frame {i} dirt band", f[int(h * 0.88) :])
+            for i, f in enumerate(frames)
+        ]
+        for name, region in regions:
+            opaque = region[..., 3] > 128
+            pale = int((opaque & (region[..., :3].min(2) > 170)).sum())
+            assert pale == 0, f"{name} has {pale} pale px"
+
+    def test_the_two_poses_do_not_drift(self, frames) -> None:
+        """A mole that changes direction must not appear to step sideways.
+
+        Both poses are mirrored about the card's centre, which is where the
+        mole's centre of mass was moved to, so the animal's weight stays
+        over the hole either way. The mole is whatever differs from the
+        edge-on frame, since that frame is the mound alone.
+        """
+        import numpy as np
+
+        mound = frames[len(frames) // 2]
+
+        def centroid(frame):
+            differs = (frame != mound).any(2)
+            ys, xs = np.nonzero(differs)
+            assert xs.size, "no mole in this frame"
+            return xs.mean()
+
+        right, left = centroid(frames[0]), centroid(frames[-1])
+        assert right == pytest.approx(left, abs=1.5), (
+            f"the mole shifts {abs(right - left):.1f} px when it turns"
+        )
+
+    def test_the_mole_sits_over_the_hole(self, frames) -> None:
+        """Centred on the card, because the card is centred on the hole."""
+        import numpy as np
+
+        mound = frames[len(frames) // 2]
+        width = mound.shape[1]
+        differs = (frames[0] != mound).any(2)
+        xs = np.nonzero(differs)[1]
+        assert xs.mean() == pytest.approx(width / 2, abs=width * 0.02)
+
+    def test_only_the_mole_moves(self, frames) -> None:
+        """Nothing in the dirt may travel with the mole.
+
+        What used to: loose clods and short arcs of the mound's own outline
+        that the claw rule claimed by proximity, and blades of grass at the
+        edge. Three or four specks sliding across the earth as the mole
+        turns, which reads as the picture coming apart.
+
+        The mole is whatever differs from the edge-on frame. If that is one
+        connected piece, everything moving is the animal; islands are
+        scenery that got dragged along.
+        """
+        import numpy as np
+
+        mound = frames[len(frames) // 2]
+        differs = (frames[0] != mound).any(2)
+        h, w = differs.shape
+
+        seen = np.zeros_like(differs)
+        sizes = []
+        for y in range(h):
+            for x in range(w):
+                if not differs[y, x] or seen[y, x]:
+                    continue
+                stack = [(y, x)]
+                seen[y, x] = True
+                n = 0
+                while stack:
+                    cy, cx = stack.pop()
+                    n += 1
+                    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        ny, nx = cy + dy, cx + dx
+                        if (
+                            0 <= ny < h
+                            and 0 <= nx < w
+                            and differs[ny, nx]
+                            and not seen[ny, nx]
+                        ):
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+                sizes.append(n)
+
+        sizes.sort(reverse=True)
+        assert sizes, "nothing moves at all"
+        strays = [n for n in sizes[1:] if n > 20]
+        assert not strays, f"scenery travels with the mole: {strays} px islands"
+        assert sizes[0] / sum(sizes) > 0.99
+
+    def test_no_grass_travels_with_the_mole(self, frames) -> None:
+        """Grass grows out of the mound, so it stays with the mound."""
+        import numpy as np
+
+        mound = frames[len(frames) // 2]
+        moving = (frames[0] != mound).any(2) | (frames[-1] != mound).any(2)
+        rgb = frames[0][..., :3].astype(int)
+        green = (
+            moving
+            & (rgb[..., 1] > rgb[..., 0] + 10)
+            & (rgb[..., 1] > rgb[..., 2] + 10)
+        )
+        assert int(green.sum()) < 100, f"{int(green.sum())} green px move"
+
+    def test_the_claws_travel_with_the_mole(self, frames) -> None:
+        """Five to a paw, drawn over the dirt in dark brown and black.
+
+        Split between the layers, their black strokes went with the mole
+        and their brown fill stayed in the mud, so turning left a wedge of
+        claw behind in the dirt. The mole's own dark marks should outnumber
+        what is left under its paws by a wide margin.
+        """
+        import numpy as np
+
+        mound = frames[len(frames) // 2]
+        paws = slice(185, 300)
+        differs = (frames[0] != mound).any(2)[paws]
+        mole_band = frames[0][paws]
+        dirt_band = mound[paws]
+
+        def dark(band, mask=None):
+            d = (band[..., 3] > 128) & (band[..., :3].max(2) < 110)
+            return int((d & mask).sum()) if mask is not None else int(d.sum())
+
+        on_mole = dark(mole_band, differs)
+        in_dirt = dark(dirt_band)
+        assert on_mole > in_dirt, (
+            f"only {on_mole} px of dark detail on the paws against "
+            f"{in_dirt} px left in the dirt"
+        )

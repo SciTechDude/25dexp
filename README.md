@@ -292,11 +292,13 @@ from its stay every frame rather than stamped on at spawn, so a mole
 forced up by hand — which the capture scenes and the tests both do — turns
 like any other instead of silently never turning.
 
-The view turns the card by spinning it about its own vertical axis — the
-card has no thickness, so its projected width is `cos(angle)` as the angle
-runs 180° → 0°, passing through zero where it is edge-on. The angle is
-eased (smoothstep), so the turn starts and stops gently and only moves fast
-in the middle where the sprite is too narrow to read. The duration comes
+The view turns the mole by spinning it about its own vertical axis — a card
+has no thickness, so its projected width is `cos(angle)` as the angle runs
+180° → 0°, passing through zero where it is edge-on. The angle is eased
+(smoothstep), so the turn starts and stops gently and only moves fast in
+the middle where the sprite is too narrow to read. Those stages are baked
+into the sprite strip rather than applied as a scale — see below. The
+duration comes
 from the rules, on the `turned` event, rather than from a constant of the
 view's own: there is one answer to how long a turn takes, and it belongs
 with the schedule that sized it. Two details that mattered:
@@ -311,12 +313,53 @@ with the schedule that sized it. Two details that mattered:
   jump across the gap it had already closed. A turn reversed just after it
   began ends immediately, which is correct — the card had barely moved.
 
-**Known, and next on the list here:** the artwork's dirt mound is part of
-the same quad as the mole, so it moves with it — it narrows through the
-turn and it slides up and down with the pop, which is not what a mound of
-earth does. The mound wants to be its own quad, left sitting at the hole
-while the mole moves against it. That is a second quad per hole plus a
-split of the artwork, so it is deferred rather than dismissed.
+#### The mound must not turn with the mole
+
+The artwork paints the mole and its dirt mound on **one sheet**, so the
+first version of the turn mirrored the card — and mirrored the earth with
+it. The mound jumped sides whenever the mole looked the other way, and the
+spin squeezed the dirt flat along with the animal. Neither is something a
+mound of earth does.
+
+Separate quads cannot fix it honestly. The mound lies on the ground while
+the mole rises 78 mm above it, so from straight overhead the mole is always
+the nearer surface: no z value puts the mound in front of it, and forcing
+the draw order with render bins would put mounds in front of the start
+menu too.
+
+So it is fixed in the art. `tools/bake_mole_turn_strip.py` separates mole
+from mound by palette, rebuilds the part of the mound the mole was
+covering, and bakes one frame per stage of the turn — the mole scaled
+about the hole's own axis over a mound that is **pixel-identical in every
+frame**. The renderer picks a frame (`turn_frame`, nearest signed width in
+`MOLE_TURN_FRAME_WIDTHS`) and sets `texture_offset`; the card keeps its
+full width and is never mirrored, so the mound cannot move. A test asserts
+the mound band is byte-identical across all seven frames, with a companion
+test that the band is *not* left-right symmetric so the first one has
+teeth.
+
+Four bugs on the way there, every one of them the mound moving when it
+should not:
+
+- A standalone "grey" rule caught the anti-aliased halo around every
+  outline and called it mole, laying a one-pixel mole fringe along the
+  mound's whole edge — which then made every column look occluded, so
+  there was nothing intact left to rebuild from.
+- The occlusion test looked *inside* the mound's band, but where the mole
+  covers the mound's top edge its pixels are *above* that edge. The test
+  is what the edge touches.
+- Medium-sized islands of dirt colour inside the head became the mound's
+  topmost pixel for their column, leaving a notch in the rebuilt contour.
+  Islands are now absorbed into whatever surrounds them.
+- The patch quarry was cut from the longest intact stretch, which is the
+  mound's right-hand end — where the grass is. The copy planted grass
+  tufts in the gap the mole had been standing in.
+
+The rebuilt stretch of mound is placeholder quality: a plateau and some
+streaking that a mole covers at rest and that is invisible at playing size
+(a mole is ~70 px on screen), but obvious in the baked strip. The honest
+fix is a mound drawn once, complete, as its own asset — at which point this
+tool reduces to compositing it with the mole.
 
 ### Why taps are hit-tested on the z = 0 plane
 
