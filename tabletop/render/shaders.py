@@ -38,6 +38,7 @@ __all__ = [
     "UNLIT_120",
     "LIT_120",
     "TEXT_120",
+    "PROJECT_SHADERS",
     "install_project_shaders",
     "LIGHT_DIRECTION",
     "FOG_COLOR",
@@ -249,11 +250,112 @@ TEXT_120 = Shader(
 )
 
 
+PROJECT_SHADERS = (UNLIT_120, LIT_120, TEXT_120)
+"""Every shader this project is willing to hand to Panda3D.
+
+Used as the test for "is this entity on a compilable shader?", by
+:func:`install_project_shaders` and by the test that guards it.
+"""
+
+
+class _MatchesNothing:
+    """A stand-in whose ``==`` is false against anything, including itself.
+
+    Used to make one branch of Ursina's shader setter unreachable without
+    reimplementing the setter around it (see
+    :func:`_disarm_ui_shader_substitution`).
+    """
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<matches nothing: tabletop disabled this comparison>"
+
+
+def _disarm_ui_shader_substitution() -> None:
+    """Make Ursina's "UI entities get the unlit shader" override unreachable.
+
+    ``Entity.shader_setter`` carries a special case: assigning a shader to
+    an entity below ``camera.ui`` whose *current* shader is
+    ``unlit_with_fog_shader`` discards the assigned value and substitutes
+    ``unlit_shader`` instead. Both are GLSL 130/140, so on macOS the
+    substituted shader cannot compile.
+
+    That branch is why retargeting a UI entity by hand does not take: the
+    assignment is swallowed and a 130 shader goes in instead, so
+    :func:`_retarget_existing_entities` cannot fix the UI on its own.
+
+    The setter reads the compared name from its own module globals, so
+    rebinding it to :class:`_MatchesNothing` kills the branch: assignments
+    then take as written, and text keeps the text shader. ``unlit_shader``
+    is pointed at :data:`UNLIT_120` as well, so that even if some other
+    path does reach that substitution it yields something compilable.
+
+    Note what *not* to do: rebinding ``unlit_with_fog_shader`` to
+    :data:`UNLIT_120` instead makes the condition match every UI entity
+    already on ``UNLIT_120`` -- including each ``Text`` on its way to
+    ``TEXT_120`` -- which silently swaps the text shader back out and draws
+    the whole HUD with no glyph coverage: invisible.
+    """
+    import ursina.entity as ursina_entity
+
+    ursina_entity.unlit_with_fog_shader = _MatchesNothing()
+    ursina_entity.unlit_shader = UNLIT_120
+
+
+def _retarget_existing_entities() -> int:
+    """Move already-built entities onto the 120 shaders. Returns how many.
+
+    Some Ursina entities exist before any app can call into this module:
+    ``ursina.raycast._raycaster`` and ``ursina.boxcast._boxcast_box`` (plus
+    their children) are constructed while ``from ursina import *`` runs, so
+    they captured ``Entity.default_shader`` as it was then -- GLSL 130.
+    Changing the default afterwards cannot reach them.
+
+    Together with the substitution that
+    :func:`_disarm_ui_shader_substitution` removes, they are what produced
+    the two ``version '130' is not supported`` lines on macOS -- neither
+    repair alone silences them. Panda compiles a shader the first time it
+    draws with it, which is why the errors landed on frame one rather than
+    at construction.
+    """
+    from ursina import Text, camera, scene
+
+    retargeted = 0
+
+    def walk(node) -> None:
+        nonlocal retargeted
+        for child in getattr(node, "children", ()):
+            shader = getattr(child, "shader", None)
+            if shader is not None and shader not in PROJECT_SHADERS:
+                replacement = TEXT_120 if isinstance(child, Text) else UNLIT_120
+                # `Text.shader_setter` reads `shader._shader`, which only
+                # exists after compile(), and raises AttributeError
+                # otherwise. `Entity`'s setter compiles on demand; Text's
+                # does not, so do it here. Compiling is pure string work
+                # (`Panda3dShader.make`) and needs no GL context, so it is
+                # safe this early.
+                if not replacement.compiled:
+                    replacement.compile()
+                child.shader = replacement
+                retargeted += 1
+            walk(child)
+
+    # `camera` is parented outside `scene`, so both roots are needed; the
+    # UI lives under camera.ui.
+    walk(scene)
+    walk(camera)
+    return retargeted
+
+
 def install_project_shaders() -> None:
     """Make :data:`UNLIT_120` the default for entities, :data:`TEXT_120` for text.
 
-    Call once, immediately after constructing ``Ursina()`` and before any
-    entity is created.
+    Call once, before constructing ``Ursina()`` and before any entity of
+    this project's own is created.
 
     ``Text`` needs separate treatment: it assigns Ursina's GLSL 130
     ``text_shader`` inside its own ``__init__``, so overriding
@@ -263,6 +365,12 @@ def install_project_shaders() -> None:
     Text also needs its *own* shader rather than the unlit one, because a
     font texture is a coverage map in the alpha channel, not a colour image
     (see :data:`TEXT_120`).
+
+    Setting the defaults only covers entities built *after* this call, and
+    only where Ursina does not override them, so two repairs follow:
+    :func:`_disarm_ui_shader_substitution` and
+    :func:`_retarget_existing_entities`. Both are required -- with either
+    one alone, macOS still logs the GLSL 130/140 compile failures.
     """
     from ursina import Entity, Text
 
@@ -275,12 +383,5 @@ def install_project_shaders() -> None:
     ursina_text.text_shader = TEXT_120
     Text.default_shader = TEXT_120
 
-    # Note: two GLSL-130 compile errors still appear in the log on macOS.
-    # They come from an Ursina entity built at *import* time (its `camera`
-    # is a module-level singleton created before this function can run), so
-    # it already holds the old default. Reassigning camera.ui/camera.overlay
-    # was tried and did not silence them, so the source is elsewhere in
-    # Ursina's startup. They are cosmetic: every project entity renders, as
-    # `python -m tabletop.apps.capture --check` verifies. Left alone
-    # deliberately -- chasing them risks re-blanking the scene, and
-    # suppressing the glgsg error category would hide real shader faults.
+    _disarm_ui_shader_substitution()
+    _retarget_existing_entities()
