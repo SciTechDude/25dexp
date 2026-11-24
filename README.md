@@ -296,6 +296,19 @@ As a backstop, the mallet also gives way when its head circle comes within
 its own radius of the exit button, so the button is never covered even if
 the pointer is still technically over the field.
 
+EXIT itself asks rather than acts. A button inside the playfield's reach
+that closed the window on one touch is a swing away from ending someone's
+round, so EXIT (and `ESC`) opens the dialog in `render/confirm.py`, and what
+it offers depends on where the player is: mid-round it pauses and offers
+resume / end the round / leave; after a round it offers play again / menu /
+leave; from the start menu it asks once before closing the window. The
+round's clock stops while the question is on screen -- a prompt about
+quitting must not cost seconds -- and the dialog is modal, so the keys that
+cycle themes underneath it do nothing while it is up. `exit_prompt` and its
+rows are plain data, tested without a window; `./run.sh capture` can render
+the `confirm` scene, which is how "is it in front of the menu it covers"
+gets answered.
+
 The clock counts **down**. Counting up makes the player work out how long
 they have left, and it turns red under ten seconds.
 

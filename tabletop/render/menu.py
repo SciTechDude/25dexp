@@ -57,7 +57,7 @@ CONTROLS = [
     ("M", "sprite mirroring"),
     ("R", "restart the round"),
     ("TAB", "back to this menu"),
-    ("ESC", "quit, or tap EXIT on the panel"),
+    ("ESC", "pause, or tap EXIT on the panel"),
 ]
 
 
@@ -152,6 +152,18 @@ class StartMenu(Entity):
 
         self.on_start = on_start
         self.on_quit = on_quit
+        """Called for the EXIT row and for ``ESC``. The app points this at
+        the confirm dialog rather than at the quit itself, so leaving is
+        always a question."""
+
+        self.blocked_by = None
+        """Something with a ``visible`` flag that takes input away.
+
+        Ursina dispatches ``input`` to every entity, so a modal panel over
+        the menu cannot stop the menu hearing the same keypress -- the menu
+        has to decline it. :mod:`tabletop.render.confirm` is what goes here.
+        """
+
         self.panel_mode: str | None = None
         """``controls``, ``rules``, or None for the level list."""
 
@@ -371,9 +383,14 @@ class StartMenu(Entity):
 
     # ------------------------------------------------------------------
 
+    @property
+    def blocked(self) -> bool:
+        """Whether a modal panel above the menu is taking input."""
+        return self.blocked_by is not None and self.blocked_by.visible
+
     def hit(self, x_mm: float, y_mm: float) -> bool:
         """Apply a tap at a table position. True if it did something."""
-        if not self.visible:
+        if not self.visible or self.blocked:
             return False
         if self.panel_mode is not None:
             self.close_panel()
@@ -393,7 +410,7 @@ class StartMenu(Entity):
         return False
 
     def input(self, key: str) -> None:
-        if not self.visible:
+        if not self.visible or self.blocked:
             return
 
         if self.panel_mode is not None:

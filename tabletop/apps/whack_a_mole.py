@@ -54,7 +54,8 @@ Controls
 ``M``            cycle sprite mirroring
 ``R``            restart the round
 ``TAB``          back to the start menu
-``ESC``          quit, as does tapping EXIT on the score panel
+``ESC``          pause and ask what to do, as does tapping EXIT on the
+                 score panel: resume, end the round, or leave the game
 """
 
 from __future__ import annotations
@@ -105,6 +106,12 @@ from tabletop.render.meshes import (
 from tabletop.render.mallet import HEAD_RADIUS_MM, REST_ANGLE_DEG
 from tabletop.render.mallet import REST_Z_MM as MALLET_REST_Z_MM
 from tabletop.render.mallet import MalletCursor
+from tabletop.render.confirm import (
+    MENU,
+    ROUND_LIVE,
+    ROUND_OVER,
+    ConfirmDialog,
+)
 from tabletop.render.menu import StartMenu
 from tabletop.render.pixel_font import (
     PixelText,
@@ -363,11 +370,30 @@ class WhackAMoleView(Entity):
         """False while the start menu is up: the scene renders, but the round
         does not run and a tap cannot reach a mole behind the menu."""
 
+        self.paused = False
+        """True while the confirm dialog is up over a round.
+
+        Distinct from ``active``: the round still exists and the field is
+        still shown, but its clock must not run while the player reads a
+        dialog -- otherwise a question about quitting costs them seconds.
+        """
+
         self.on_menu: Callable[[], None] | None = None
         """Set by the app to hand control back to the start menu."""
 
+        self.on_exit_request: Callable[[], None] | None = None
+        """Set by the app: EXIT or ``ESC`` was pressed during a round.
+
+        The view raises the intent and the app decides what to ask, because
+        only the app knows how to end a round or close the window."""
+
         self.menu = None
         """The start menu, once the app has built one."""
+
+        self.confirm = None
+        """The confirm dialog, once the app has built one.
+
+        While it is visible it owns every key and tap: see :meth:`input`."""
 
         self.rig = TableRig(
             calibration,
@@ -706,7 +732,7 @@ class WhackAMoleView(Entity):
             text="[click] swing  [right-drag] move camera  [arrows] walk/height  "
                  "[P] parallax  [D] difficulty  [T] theme  [B] bezel  "
                  "[F] facing  [M] mirror  [R] restart  [TAB] menu  "
-                 "[ESC]/[EXIT] quit",
+                 "[ESC]/[EXIT] pause",
             origin=(0, -0.5),
             position=Vec2(0, -0.47),
             scale=0.7,
@@ -731,6 +757,25 @@ class WhackAMoleView(Entity):
         return screen_ndc_to_glass_mm(mouse.x * 2.0 / aspect, mouse.y * 2.0, params)
 
     def input(self, key: str) -> None:
+        # The dialog is modal, and it is checked before anything else --
+        # including before `active`, since it can be up over the menu as
+        # well as over a round.
+        if self.confirm is not None and self.confirm.visible:
+            if key == "left mouse down":
+                pos = self.mouse_table_mm()
+                if pos is not None:
+                    self.confirm.hit(
+                        *glass_mm_to_plane_mm(
+                            pos[0],
+                            pos[1],
+                            self.confirm.plane_z_mm,
+                            self.lens_eye_mm,
+                        )
+                    )
+            else:
+                self.confirm.key(key)
+            return
+
         if not self.active:
             # The menu owns the pointer while it is up: it lays its rows out
             # in table millimetres, and this is where a pointer position
@@ -747,8 +792,16 @@ class WhackAMoleView(Entity):
                         )
                     )
             return
+        # EXIT and ESC both ask rather than act: a swing can land on the
+        # exit button, and dropping a player out of a live round on one
+        # touch is what this dialog exists to prevent.
         if key == "left mouse down" and self._tapped_exit():
-            application.quit()
+            if self.on_exit_request is not None:
+                self.on_exit_request()
+            return
+        if key == "escape":
+            if self.on_exit_request is not None:
+                self.on_exit_request()
             return
         if key == "tab" and self.on_menu is not None:
             self.on_menu()
@@ -884,6 +937,12 @@ class WhackAMoleView(Entity):
 
         if not self.active:
             # Menu is up: keep rendering, run no round.
+            return
+
+        if self.paused:
+            # Dialog is up over the round: the view still tracks the head,
+            # so the panel keeps its parallax, but the round's clock, the
+            # moles and the mallet all hold still.
             return
 
         self._follow_hand()
@@ -1285,8 +1344,11 @@ class WhackAMoleView(Entity):
             and self.game.on_field(*self._pointer_mm)
             and self._head_clears_exit(self._pointer_mm)
         )
+        # Paused counts as not playing: the dialog's rows are tapped with
+        # the system cursor, so the mallet must give the pointer back even
+        # though the round is still there.
         mallet_owns = mallet_owns_pointer(
-            self.active, self.game.running, on_field
+            self.active and not self.paused, self.game.running, on_field
         )
         want_cursor = not mallet_owns
         if bool(mouse.visible) != want_cursor:
@@ -1489,8 +1551,14 @@ def main() -> None:
         display_width_mm=calibration.display_width_mm,
         display_height_mm=calibration.display_height_mm,
         finish=view.finish,
-        on_quit=application.quit,
     )
+    confirm = ConfirmDialog(
+        display_width_mm=calibration.display_width_mm,
+        display_height_mm=calibration.display_height_mm,
+        finish=view.finish,
+    )
+    # The dialog can be asked for from the menu, and is modal over it.
+    menu.blocked_by = confirm
 
     def start(level) -> None:
         game.set_difficulty(level)
@@ -1498,20 +1566,53 @@ def main() -> None:
         view.effects.clear()
         view._hide_banner()
         view.active = True
+        view.paused = False
         view.controls_hint.enabled = True
         view.show_mallet()
 
     def open_menu() -> None:
         view.active = False
+        view.paused = False
         view.controls_hint.enabled = False
         view.retire_mallet()
         # The round's tally belongs to the round that is being left.
         view._hide_banner()
         menu.show()
 
+    def resolve(action: str) -> None:
+        """Carry out a choice from the dialog. The dialog has closed itself."""
+        view.paused = False
+        if action in ("resume", "cancel"):
+            return
+        if action == "play_again":
+            start(game.difficulty)
+        elif action in ("end_round", "menu"):
+            open_menu()
+        elif action == "quit":
+            application.quit()
+        else:  # pragma: no cover - ACTIONS and this branch are tested together
+            raise ValueError(f"unhandled dialog action {action!r}")
+
+    def ask_exit() -> None:
+        """EXIT or ESC, from wherever the player is."""
+        if not view.active:
+            confirm.ask_for_state(MENU, resolve)
+            return
+        if game.running:
+            # Hold the round where it is while the question is on screen.
+            view.paused = True
+            confirm.ask_for_state(ROUND_LIVE, resolve)
+            return
+        confirm.ask_for_state(
+            ROUND_OVER, resolve, score=game.score, accuracy=game.accuracy
+        )
+
     menu.on_start = start
+    menu.on_quit = ask_exit
     view.on_menu = open_menu
+    view.on_exit_request = ask_exit
     view.menu = menu
+    view.confirm = confirm
     if args.skip_menu:
         start(difficulty_by_name(args.difficulty))
     else:

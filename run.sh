@@ -8,7 +8,7 @@
 #   ./run.sh sky          "eye in the sky" view
 #   ./run.sh touch        mouse -> input snapshots -> drawn contacts
 #   ./run.sh capture      headless PNG render + blank-frame check
-#   ./run.sh shots        headless PNGs of the game and its menu
+#   ./run.sh shots        headless PNGs of the game, its menu and exit dialog
 #   ./run.sh calibrate    measure your screen, write calibration JSON
 #   ./run.sh probe        Linux only: what an attached touchscreen reports
 #   ./run.sh test         the test suite
@@ -118,6 +118,7 @@ case "$cmd" in
         mkdir -p "$out"
         "$PY" -m tabletop.apps.capture --scene game --out "$out" --check "$@"
         "$PY" -m tabletop.apps.capture --scene menu --out "$out" --check "$@"
+        "$PY" -m tabletop.apps.capture --scene confirm --out "$out" --check "$@"
         echo "frames written to $out/"
         ;;
 

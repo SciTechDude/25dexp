@@ -152,6 +152,61 @@ def build_menu_scene(calibration: TableCalibration):
     return MENU_VIEWS, menu_pose, None
 
 
+CONFIRM_VIEWS: list[tuple[str, ProjectionMode, Eye]] = [
+    ("confirm_1_paused", ProjectionMode.PERSPECTIVE_FIXED, Eye(0.0, 0.0, 700.0)),
+    ("confirm_2_round_over", ProjectionMode.PERSPECTIVE_FIXED, Eye(0.0, 0.0, 700.0)),
+    ("confirm_3_menu", ProjectionMode.PERSPECTIVE_FIXED, Eye(0.0, 0.0, 700.0)),
+]
+
+
+def build_confirm_scene(calibration: TableCalibration):
+    """The exit dialog in each of the three states it is asked from.
+
+    Worth capturing rather than only unit-testing: the dialog is the one
+    panel drawn above the menu, and "is it in front of what it covers" is a
+    question only a frame can answer.
+    """
+    from ursina import scene
+
+    from tabletop.apps.whack_a_mole import WhackAMoleView
+    from tabletop.game.whack_a_mole import GameConfig
+    from tabletop.render.confirm import MENU, ROUND_LIVE, ROUND_OVER, ConfirmDialog
+    from tabletop.render.menu import StartMenu
+
+    _, pose, _ = build_game_scene(calibration)
+    view = next(e for e in scene.children if isinstance(e, WhackAMoleView))
+    menu = StartMenu(
+        GameConfig(),
+        on_start=lambda level: None,
+        display_width_mm=calibration.display_width_mm,
+        display_height_mm=calibration.display_height_mm,
+    )
+    menu.hide()
+    confirm = ConfirmDialog(
+        display_width_mm=calibration.display_width_mm,
+        display_height_mm=calibration.display_height_mm,
+    )
+    menu.blocked_by = confirm
+    view.confirm = confirm
+
+    def show(name: str) -> None:
+        if name.endswith("paused"):
+            menu.hide()
+            view.paused = True
+            confirm.ask_for_state(ROUND_LIVE, lambda action: None)
+        elif name.endswith("round_over"):
+            menu.hide()
+            view._show_banner("ROUND OVER\nSCORE 240\nACCURACY 71%")
+            confirm.ask_for_state(
+                ROUND_OVER, lambda action: None, score=240, accuracy=0.71
+            )
+        else:
+            menu.show()
+            confirm.ask_for_state(MENU, lambda action: None)
+
+    return CONFIRM_VIEWS, pose, show
+
+
 def build_game_scene(calibration: TableCalibration, seed: int = 7):
     """The game, with moles up and one impact burst in flight.
 
@@ -240,9 +295,10 @@ def main() -> int:
     parser.add_argument(
         "--scene",
         default="depth",
-        choices=("depth", "game", "menu"),
+        choices=("depth", "game", "menu", "confirm"),
         help="depth: projection-mode comparison. game: whack-a-mole. "
-             "menu: the start menu over the game.",
+             "menu: the start menu over the game. confirm: the exit dialog "
+             "in each state it is asked from.",
     )
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
@@ -284,6 +340,7 @@ def main() -> int:
         "depth": build_depth_scene,
         "game": build_game_scene,
         "menu": build_menu_scene,
+        "confirm": build_confirm_scene,
     }
     views, pose, before_capture = builders[args.scene](calibration)
 
