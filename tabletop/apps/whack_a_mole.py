@@ -172,6 +172,29 @@ positioned by its centre, so without this the mound lands short of the hole
 and the real rim shows through above it.
 """
 
+POP_SHADE_RADIUS = 0.80
+"""Radius of the sprite's pop shade, as a fraction of the hole radius.
+
+Inside the rim, so it darkens the hole rather than marking the grass
+around it.
+"""
+
+POP_SHADE_ALPHA = 0.55
+"""How dark the pop shade gets at its strongest.
+
+Strongest is with the mole concealed, which is the moment the shade is
+doing its job: this is a tell that something is in the hole, not a cast
+shadow tracking a body above it.
+"""
+
+POP_SHADE_LINGER_S = 0.16
+"""How long the shade stays after a mole has gone back down.
+
+Short. It is the trailing half of the cue -- the hole still reads as
+occupied for a moment after the mole drops, which is what stops a retreat
+from looking like the mole was deleted.
+"""
+
 CAMERA_MARKER_RADIUS_MM = 7.0
 """Radius of the viewer marker, which rides the bezel.
 
@@ -332,6 +355,88 @@ def mallet_owns_pointer(
     return playing and round_running and pointer_on_field
 
 
+def turn_spin_factor(remaining_s: float, duration_s: float) -> float:
+    """Width multiplier partway through a mole's turn, in -1..+1.
+
+    The sprite is a flat card with no thickness, so the honest way to turn
+    it is to spin it about its own vertical axis. A spinning card's
+    projected width is the cosine of its angle, so the angle running
+    180 deg -> 0 deg gives -1 -> +1 and passes through zero halfway, where
+    the card is edge-on and invisible. That zero crossing is the whole
+    effect: without it the sprite appears to be scaled rather than turned.
+
+    The result multiplies the signed width of the mole's **new** facing, so
+    -1 at the start is still the old pose and +1 is the new one. Anything
+    outside a turn gets +1, which is the resting case.
+
+    The angle is eased rather than swept at a constant rate, so the turn
+    starts and finishes gently and the card is only ever moving fast in the
+    middle, where it is too narrow to read anyway. A constant sweep makes
+    the first and last frames the most conspicuous, which is where the
+    sprite is widest and a sudden start shows most.
+    """
+    if remaining_s <= 0.0 or duration_s <= 0.0:
+        return 1.0
+    progress = clamp(1.0 - remaining_s / duration_s, 0.0, 1.0)
+    # Smoothstep: zero rate of change at both ends, and still 0.5 at the
+    # halfway point, so the card passes edge-on exactly mid-turn.
+    eased = progress * progress * (3.0 - 2.0 * progress)
+    return -math.cos(math.pi * eased)
+
+
+def pop_shade_alpha(
+    mole_in_hole: bool,
+    height: float,
+    linger_left_s: float,
+    linger_s: float = POP_SHADE_LINGER_S,
+) -> float:
+    """Opacity of the dark patch in a hole, as a mole passes through it.
+
+    Not a cast shadow. A cast shadow of a body this far above the glass
+    lands about 52 mm away with the light the shaders use -- outside the
+    40 mm rim, on the grass, beside the mound the artwork paints -- and
+    that reads as a dark blob with no clear owner. This instead sits in the
+    hole, at the hole's own position, and says "occupied".
+
+    Darkest with the mole concealed (``height`` 0) and gone by the time it
+    is fully out, so it shows in the moments before the pop and again as
+    the mole drops back in. Once the hole is empty, ``linger_left_s``
+    carries it on for a beat, which is what keeps a retreat from looking
+    like the mole was simply deleted.
+
+    ``mole_in_hole`` is not inferable from the other two: a mole at the
+    bottom of its rise and an empty hole are both ``height`` 0, and
+    treating them alike left every empty hole on the field permanently
+    dark once its linger had run out.
+    """
+    if not mole_in_hole:
+        return POP_SHADE_ALPHA * clamp(
+            linger_left_s / max(linger_s, 1e-6), 0.0, 1.0
+        )
+    return POP_SHADE_ALPHA * (1.0 - clamp(height, 0.0, 1.0))
+
+
+def turn_restart_s(remaining_s: float, duration_s: float) -> float:
+    """Time to put on the clock when a mole turns. Handles turning twice.
+
+    A mole that turns again before the first turn has finished must not
+    restart the spin: its facing has just flipped, so a fresh spin would
+    begin from the opposite width and the card would jump across the gap
+    it had already closed.
+
+    Mirroring the remaining time instead makes the width continuous.
+    :func:`turn_spin_factor` is antisymmetric about the midpoint -- the
+    factor at ``duration - r`` is the negative of the factor at ``r`` --
+    and the facing it multiplies has just changed sign, so the two cancel
+    and the card carries on from exactly the width it was at. A turn
+    reversed just after it began therefore ends immediately, which is
+    right: the card had barely moved, and it is back where it started.
+    """
+    if remaining_s <= 0.0:
+        return duration_s
+    return clamp(duration_s - remaining_s, 0.0, duration_s)
+
+
 def _with_alpha(base, alpha: float) -> Vec4:
     """A colour at a given opacity. Vec4 avoids the 0-1 / 0-255 helpers."""
     return Vec4(base[0], base[1], base[2], clamp(alpha, 0.0, 1.0))
@@ -481,6 +586,22 @@ class WhackAMoleView(Entity):
         self.features: list[Entity] = []
         self.shadows: list[Entity] = []
         self.paws: list[list[Entity]] = []
+        self.turn_left_s: list[float] = [0.0] * cfg.total_holes()
+        """Seconds left in each hole's turn animation, 0 when it is not
+        turning. Started by a ``turned`` event and run down in
+        :meth:`_sync_moles`: the rules say when a mole turns and how long
+        it has, the view owns the clock for what that looks like."""
+
+        self.shade_left_s: list[float] = [0.0] * cfg.total_holes()
+        """Seconds of pop shade left in each hole after its mole has gone.
+        See :data:`POP_SHADE_LINGER_S`."""
+
+        self.turn_span_s: list[float] = [0.0] * cfg.total_holes()
+        """How long the turn in flight was given, from the event that
+        started it. Per hole rather than one constant, because the span is
+        a fraction of *that* mole's time in view -- so it is shorter at a
+        faster difficulty and later in the round, which is what keeps the
+        turn proportionate instead of a fixed animation stapled on."""
 
         # Fresh mesh per entity -- see the note in _build_field.
         def new_well_mesh():
@@ -553,15 +674,22 @@ class WhackAMoleView(Entity):
             self.moles.append(mole)
             self.paws.append([])
 
-            # The procedural body needs a cast shadow to read as above the
-            # ground; the sprite already paints its own mound and contact
-            # shading, where a second shadow just looks like a dark blob
-            # sitting beside the mole.
+            # One entity, two jobs. The procedural body gets a cast
+            # shadow offset along the light, which is where a solid thing's
+            # shadow lands. The sprite gets a pop shade sitting in the hole
+            # instead -- a cast shadow for a card whose artwork paints its
+            # own mound came out as a dark blob on the grass beside the
+            # mole. See pop_shade_alpha.
             shadow = Entity(
-                model=disc_mesh(cfg.mole_radius_mm * 1.05, segments=16),
+                model=disc_mesh(
+                    cfg.hole_radius_mm * POP_SHADE_RADIUS
+                    if self.use_sprite
+                    else cfg.mole_radius_mm * 1.05,
+                    segments=16,
+                ),
                 color=color.rgba32(0, 0, 0, 115),
                 shader=UNLIT_120,
-                enabled=not self.use_sprite,
+                enabled=False,
             )
             self.shadows.append(shadow)
 
@@ -960,8 +1088,13 @@ class WhackAMoleView(Entity):
         # the final second still finishes its animation.
         self.effects.update(time.dt)
 
-        self._sync_moles()
+        # Events first, then draw: they are what this tick produced, and a
+        # frame drawn before them shows the state they describe without the
+        # reaction to it. A mole that turned was the visible case -- the
+        # card snapped to its new pose for one frame and only then started
+        # spinning toward it, so a smooth turn had a jump at the front.
         self._handle_events(events)
+        self._sync_moles()
         self._sync_effects()
         self._update_scoreboard()
         self._update_hud()
@@ -1031,11 +1164,18 @@ class WhackAMoleView(Entity):
         return MIRROR_MODES[self.mirror_index]
 
     def _mirror_for(self, hole) -> bool:
-        """Whether this mole's sprite should be flipped horizontally."""
+        """Whether this mole's sprite should be flipped horizontally.
+
+        Only the ``random`` mode follows the rules' facing, and so only
+        that mode shows a mole turning while it is out -- the other three
+        are fixed patterns kept for comparing the look, and a mole under
+        them faces the same way for its whole life.
+        """
         mode = self.mirror_mode
         if mode == "random":
             # The art faces right, so a mole the rules marked as facing
-            # right needs no flip.
+            # right needs no flip. This is read every frame rather than
+            # once per spawn, because a mole that is out can turn.
             return not hole.faces_right
         if mode == "always":
             return True
@@ -1087,6 +1227,36 @@ class WhackAMoleView(Entity):
         down = -cfg.hole_depth_mm - SPRITE_DOWN_CLEARANCE_MM - z_extent / 2.0
         return down + (SPRITE_Z_UP_MM - down) * height
 
+    def _sync_pop_shade(self, hole) -> None:
+        """Darken a hole as a mole passes through its mouth.
+
+        Drawn at the hole's own position, not offset along the light: see
+        :func:`pop_shade_alpha` for why the sprite gets this instead of a
+        cast shadow.
+        """
+        index = hole.index
+        if hole.state is MoleState.DOWN:
+            self.shade_left_s[index] = max(
+                0.0, self.shade_left_s[index] - time.dt
+            )
+        else:
+            # Re-armed while the mole exists, so the linger always starts
+            # full however the mole left -- whacked or escaped.
+            self.shade_left_s[index] = POP_SHADE_LINGER_S
+
+        shade = self.shadows[index]
+        alpha = pop_shade_alpha(
+            hole.state is not MoleState.DOWN,
+            hole.height,
+            self.shade_left_s[index],
+        )
+        if alpha <= 0.004:
+            shade.enabled = False
+            return
+        shade.enabled = True
+        shade.position = Vec3(*table_to_world(hole.x_mm, hole.y_mm, 1.5))
+        shade.color = _with_alpha((0.0, 0.0, 0.0), alpha)
+
     def _sync_moles(self) -> None:
         game = self.game
         cfg = game.config
@@ -1099,12 +1269,25 @@ class WhackAMoleView(Entity):
 
         for hole in game.holes():
             mole = self.moles[hole.index]
+            if self.use_sprite:
+                # Before the mole entity, because the shade outlives it:
+                # it is still fading for a beat after the hole is empty.
+                self._sync_pop_shade(hole)
             # A mole at rest is not drawn at all. Relying on the well to
             # occlude it leaves the card's depth fighting the floor's.
             mole.enabled = hole.state is not MoleState.DOWN
             if not mole.enabled:
-                self.shadows[hole.index].enabled = False
+                if not self.use_sprite:
+                    self.shadows[hole.index].enabled = False
+                # Dropped rather than left to run down, so the next mole out
+                # of this hole does not inherit half a spin.
+                self.turn_left_s[hole.index] = 0.0
+                self.turn_span_s[hole.index] = 0.0
                 continue
+            if self.turn_left_s[hole.index] > 0.0:
+                self.turn_left_s[hole.index] = max(
+                    0.0, self.turn_left_s[hole.index] - time.dt
+                )
             z_mm = game.mole_z_mm(hole.height)
             if self.use_sprite:
                 mole.position = Vec3(
@@ -1139,7 +1322,15 @@ class WhackAMoleView(Entity):
                 # Negative X scale mirrors the card horizontally.
                 width = abs(self._card_scale[0]) * (1.0 + 0.35 * squash)
                 height_scale = self._card_scale[1] * (1.0 - 0.30 * squash)
-                mole.scale_x = -width if self._mirror_for(hole) else width
+                facing = -width if self._mirror_for(hole) else width
+                # Mid-turn the card is spinning about its own vertical axis,
+                # so the width it presents is the new facing's, narrowed and
+                # briefly reversed. `hole.faces_right` has already changed
+                # by the time the event arrives, which is why the factor
+                # starts at -1.
+                mole.scale_x = facing * turn_spin_factor(
+                    self.turn_left_s[hole.index], self.turn_span_s[hole.index]
+                )
                 mole.scale_y = height_scale
             else:
                 # Lean backward, away from the player, so the face comes up
@@ -1171,7 +1362,7 @@ class WhackAMoleView(Entity):
             top_mm = z_mm + cfg.mole_height_mm
             shadow = self.shadows[hole.index]
             if self.use_sprite:
-                continue
+                continue  # handled by _sync_pop_shade, before the card
             if top_mm <= 2.0:
                 shadow.enabled = False
             else:
@@ -1405,6 +1596,12 @@ class WhackAMoleView(Entity):
         for event in events:
             if event.kind == "hit":
                 self.effects.emit_hit(event.x_mm, event.y_mm)
+            if event.kind == "turned" and event.hole_index is not None:
+                span = event.duration_s
+                self.turn_left_s[event.hole_index] = turn_restart_s(
+                    self.turn_left_s[event.hole_index], span
+                )
+                self.turn_span_s[event.hole_index] = span
             if event.kind == "round_over":
                 # The pointer returns to the mouse on its own, because the
                 # round is no longer running -- see _sync_pointer.

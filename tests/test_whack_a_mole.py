@@ -608,3 +608,503 @@ class TestPointerOwnership:
                     round_running=running,
                     pointer_on_field=on_field,
                 )
+
+
+class TestTurningInPlace:
+    """Every mole turns once, partway through its time in view.
+
+    The schedule is a fraction of that mole's own visible span -- the pop
+    out, the stay and the pop back down -- so the two poses get equal time
+    at every difficulty and at every point in the round's ramp.
+
+    An earlier version rolled a probability per second of being up
+    instead. Three things were wrong with it, and all three are what these
+    tests pin: at beginner pace moles usually never turned at all, the
+    turn landed at an arbitrary moment so the two poses were not
+    symmetric, and the animation was a fixed 180 ms stapled onto stays
+    that are three times that at one level and half it at another.
+    """
+
+    DT = 1 / 240
+    """Fine steps: these assertions are about *when* a turn happens, and a
+    coarse step blurs that by up to a frame."""
+
+    def first_mole_life(self, game: WhackAMole):
+        """Watch one mole from spawn to gone, with no taps.
+
+        Returns ``(visible_s, turn_start_s, turn_span_s)``, all measured
+        rather than read out of the model, so the schedule is checked
+        against what the mole actually did.
+        """
+        index: int | None = None
+        visible_s = 0.0
+        turn_start_s: float | None = None
+        turn_span_s: float | None = None
+
+        for _ in range(20000):
+            events = game.update(self.DT, [])
+            states = {h.index: h.state for h in game.holes()}
+
+            if index is None:
+                rising = [i for i, st in states.items() if st is MoleState.RISING]
+                if not rising:
+                    continue
+                index = rising[0]
+                visible_s = self.DT
+                continue
+
+            for event in events:
+                if event.kind == "turned" and event.hole_index == index:
+                    turn_start_s = visible_s
+                    turn_span_s = event.duration_s
+
+            if states[index] is MoleState.DOWN:
+                assert turn_start_s is not None, "the mole never turned"
+                return visible_s, turn_start_s, turn_span_s
+
+            visible_s += self.DT
+
+        raise AssertionError("the mole never went back down")
+
+    @pytest.mark.parametrize("difficulty", DIFFICULTIES, ids=lambda d: d.name)
+    def test_every_level_turns_every_mole_exactly_once(self, difficulty) -> None:
+        """The reported bug: at beginner pace, moles did not turn."""
+        game = WhackAMole(
+            field_width_mm=FIELD_W,
+            field_height_mm=FIELD_H,
+            seed=5,
+            difficulty=difficulty,
+        )
+        turns = 0
+        while game.running:
+            turns += sum(1 for e in game.update(1 / 60, []) if e.kind == "turned")
+        # Never more than one per mole, and the only mole that can miss its
+        # turn is one still in the air when the round ends.
+        assert game.spawned - 1 <= turns <= game.spawned
+        assert turns > 0
+
+    @pytest.mark.parametrize("difficulty", DIFFICULTIES, ids=lambda d: d.name)
+    def test_the_turn_starts_at_40_percent_of_the_visible_span(
+        self, difficulty
+    ) -> None:
+        game = WhackAMole(
+            field_width_mm=FIELD_W,
+            field_height_mm=FIELD_H,
+            seed=2,
+            difficulty=difficulty,
+        )
+        visible_s, turn_start_s, turn_span_s = self.first_mole_life(game)
+        cfg = game.config
+        assert turn_start_s == pytest.approx(
+            cfg.turn_at_fraction * visible_s, abs=4 * self.DT
+        )
+        assert turn_span_s == pytest.approx(
+            cfg.turn_span_fraction * visible_s, abs=4 * self.DT
+        )
+
+    @pytest.mark.parametrize("difficulty", DIFFICULTIES, ids=lambda d: d.name)
+    def test_the_two_poses_get_equal_time(self, difficulty) -> None:
+        """40 / 20 / 40, centred on the mole's life."""
+        game = WhackAMole(
+            field_width_mm=FIELD_W,
+            field_height_mm=FIELD_H,
+            seed=2,
+            difficulty=difficulty,
+        )
+        visible_s, turn_start_s, turn_span_s = self.first_mole_life(game)
+        first_side = turn_start_s
+        second_side = visible_s - (turn_start_s + turn_span_s)
+        assert first_side == pytest.approx(second_side, abs=8 * self.DT)
+        midpoint = turn_start_s + turn_span_s / 2.0
+        assert midpoint == pytest.approx(visible_s / 2.0, abs=8 * self.DT)
+
+    @pytest.mark.parametrize("difficulty", DIFFICULTIES, ids=lambda d: d.name)
+    def test_the_span_counts_the_pop_out_and_the_pop_back_down(
+        self, difficulty
+    ) -> None:
+        """Not just the stay: the mole is visible while it is moving too.
+
+        Scheduling against the stay alone put the turn early and left the
+        second pose short by the rise plus the retract -- a fifth of the
+        whole life at medium.
+        """
+        game = WhackAMole(
+            field_width_mm=FIELD_W,
+            field_height_mm=FIELD_H,
+            seed=2,
+            difficulty=difficulty,
+        )
+        visible_s, _, turn_span_s = self.first_mole_life(game)
+        cfg = game.config
+        implied_stay = visible_s - cfg.rise_time_s - cfg.retract_time_s
+        # The stay the ramp would hand out this early in the round.
+        # Tolerance for the step size the life was measured in.
+        slack = 4 * self.DT
+        assert cfg.up_time_end_s - slack <= implied_stay
+        assert implied_stay <= cfg.up_time_start_s + slack
+        # And the span is a fifth of the whole life, not a fifth of the stay.
+        assert turn_span_s > cfg.turn_span_fraction * implied_stay
+
+    def test_the_default_split_is_symmetric(self) -> None:
+        """Guard the numbers: 40 + 20 + 40 has to make the whole."""
+        cfg = GameConfig()
+        assert 2 * cfg.turn_at_fraction + cfg.turn_span_fraction == 1.0
+
+    def test_a_faster_level_turns_faster(self) -> None:
+        """The span is a fraction, so it shrinks with the mole's life."""
+
+        def span(difficulty) -> float:
+            game = WhackAMole(
+                field_width_mm=FIELD_W,
+                field_height_mm=FIELD_H,
+                seed=2,
+                difficulty=difficulty,
+            )
+            return self.first_mole_life(game)[2]
+
+        assert span(BEGINNER) > span(MEDIUM) > span(ADVANCED) > 0.0
+
+    def test_the_turn_shortens_as_the_round_speeds_up(self) -> None:
+        """The ramp applies too: a mole late in a round is out for less."""
+        game = make_game()
+        spans: list[float] = []
+        while game.running:
+            spans.extend(
+                e.duration_s for e in game.update(1 / 60, []) if e.kind == "turned"
+            )
+        assert len(spans) > 4
+        assert spans[-1] < spans[0]
+
+    def test_the_turn_flips_the_facing(self) -> None:
+        game = make_game()
+        before: dict[int, bool] = {}
+        for _ in range(4000):
+            before = {h.index: h.faces_right for h in game.holes()}
+            events = game.update(self.DT, [])
+            turns = [e for e in events if e.kind == "turned"]
+            if turns:
+                index = turns[0].hole_index
+                assert game.holes()[index].faces_right != before[index]
+                return
+        raise AssertionError("no mole turned")
+
+    def test_a_struck_mole_does_not_turn_on_its_way_down(self) -> None:
+        """It is being driven back down; looking around would ignore that."""
+        game = make_game()
+        struck: int | None = None
+        for _ in range(8000):
+            if struck is None:
+                up = [h for h in game.holes() if h.state is MoleState.UP]
+                if up:
+                    hole = up[0]
+                    events = game.update(self.DT, [tap(hole.x_mm, hole.y_mm)])
+                    if any(e.kind == "hit" for e in events):
+                        struck = hole.index
+                    continue
+                game.update(self.DT, [])
+                continue
+
+            if game.holes()[struck].state is not MoleState.STRUCK:
+                return  # it got all the way down without turning
+            events = game.update(self.DT, [])
+            assert not any(
+                e.kind == "turned" and e.hole_index == struck for e in events
+            )
+        raise AssertionError("never hit a mole")
+
+    def test_turning_can_be_switched_off(self) -> None:
+        game = make_game(config=GameConfig(turn_span_fraction=0.0))
+        while game.running:
+            assert not any(e.kind == "turned" for e in game.update(1 / 60, []))
+
+    def test_turning_does_not_disturb_the_spawn_sequence(self) -> None:
+        """Decoration must not shift the gameplay a seed produces.
+
+        The schedule draws no random numbers now, so this holds by
+        construction -- and this is what will catch it if some later change
+        to the turn starts drawing one from the game's generator.
+        """
+
+        def spawn_order(span_fraction: float) -> list[tuple[float, int]]:
+            game = WhackAMole(
+                field_width_mm=FIELD_W,
+                field_height_mm=FIELD_H,
+                seed=99,
+                config=GameConfig(turn_span_fraction=span_fraction),
+            )
+            order: list[tuple[float, int]] = []
+            previous = {h.index: h.state for h in game.holes()}
+            while game.running:
+                game.update(1 / 60, [])
+                for hole in game.holes():
+                    if (
+                        hole.state is MoleState.RISING
+                        and previous[hole.index] is MoleState.DOWN
+                    ):
+                        order.append((round(game.elapsed_s, 4), hole.index))
+                    previous[hole.index] = hole.state
+            return order
+
+        assert spawn_order(0.2) == spawn_order(0.0)
+
+    @pytest.mark.parametrize("difficulty", DIFFICULTIES, ids=lambda d: d.name)
+    def test_the_pace_of_the_round_is_untouched(self, difficulty) -> None:
+        """What the player feels, and the second reported bug: medium came
+        out feeling as slow as beginner.
+
+        Turning is decoration. If adding it changed how many moles a round
+        produces or how long each is out, the level would feel like a
+        different level.
+        """
+
+        def pacing(span_fraction: float) -> tuple[int, int]:
+            game = WhackAMole(
+                field_width_mm=FIELD_W,
+                field_height_mm=FIELD_H,
+                seed=21,
+                difficulty=difficulty,
+                config=GameConfig(turn_span_fraction=span_fraction),
+            )
+            visible_frames = 0
+            while game.running:
+                game.update(1 / 60, [])
+                visible_frames += sum(
+                    1 for h in game.holes() if h.state is not MoleState.DOWN
+                )
+            return game.spawned, visible_frames
+
+        assert pacing(0.2) == pacing(0.0)
+
+    def test_the_same_seed_turns_the_same_way(self) -> None:
+        def turns(seed: int) -> list[tuple[float, int, float]]:
+            game = WhackAMole(
+                field_width_mm=FIELD_W, field_height_mm=FIELD_H, seed=seed
+            )
+            seen: list[tuple[float, int, float]] = []
+            while game.running:
+                for event in game.update(1 / 60, []):
+                    if event.kind == "turned":
+                        seen.append(
+                            (
+                                round(game.elapsed_s, 4),
+                                event.hole_index,
+                                round(event.duration_s, 6),
+                            )
+                        )
+            return seen
+
+        assert turns(4) == turns(4)
+        assert turns(4) != turns(5)
+
+    def test_a_reset_round_still_turns(self) -> None:
+        game = make_game()
+        while game.running:
+            game.update(1 / 60, [])
+        game.reset(seed=77)
+        turns = 0
+        while game.running:
+            turns += sum(1 for e in game.update(1 / 60, []) if e.kind == "turned")
+        assert turns > 0
+
+
+class TestTurnSpin:
+    """How the view shows a turn: a card spinning about its own axis.
+
+    The duration is the rules' (the ``turned`` event carries it), so these
+    use an explicit span rather than a constant of the view's own.
+    """
+
+    SPAN = 0.3
+
+    def test_a_mole_that_is_not_turning_keeps_its_full_width(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        assert turn_spin_factor(0.0, self.SPAN) == pytest.approx(1.0)
+
+    def test_a_zero_span_is_not_a_division_by_zero(self) -> None:
+        """A view that never heard a span must still draw the mole."""
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        assert turn_spin_factor(0.1, 0.0) == pytest.approx(1.0)
+
+    def test_the_spin_starts_on_the_old_pose(self) -> None:
+        """The rules flip the facing at the start of the turn, so the
+        animation has to open by showing its mirror -- otherwise the card
+        snaps to the new pose and then spins, which looks like two turns."""
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        assert turn_spin_factor(self.SPAN, self.SPAN) == pytest.approx(-1.0)
+
+    def test_the_card_passes_through_edge_on_at_the_midpoint(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        assert turn_spin_factor(self.SPAN / 2, self.SPAN) == pytest.approx(
+            0.0, abs=1e-9
+        )
+
+    def test_the_spin_is_monotonic(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        steps = 20
+        values = [
+            turn_spin_factor(self.SPAN * (1.0 - i / steps), self.SPAN)
+            for i in range(steps + 1)
+        ]
+        assert values == sorted(values)
+
+    def test_the_factor_never_widens_the_card(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        for i in range(41):
+            factor = turn_spin_factor(self.SPAN * i / 40, self.SPAN)
+            assert -1.0 <= factor <= 1.0
+
+    def test_the_spin_eases_in_and_out(self) -> None:
+        """Smooth at both ends: the first and last steps move the card
+        least, which is what keeps a turn from starting with a jolt."""
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        steps = 24
+        values = [
+            turn_spin_factor(self.SPAN * (1.0 - i / steps), self.SPAN)
+            for i in range(steps + 1)
+        ]
+        deltas = [b - a for a, b in zip(values, values[1:])]
+        middle = deltas[len(deltas) // 2]
+        assert deltas[0] < middle / 3
+        assert deltas[-1] < middle / 3
+
+    def test_no_step_of_the_spin_is_a_jump(self) -> None:
+        """At 60 Hz, even the shortest span this project produces moves the
+        card less than half its width per frame."""
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        dt = 1 / 60
+        remaining = self.SPAN
+        previous = turn_spin_factor(remaining, self.SPAN)
+        while remaining > 0.0:
+            remaining = max(0.0, remaining - dt)
+            current = turn_spin_factor(remaining, self.SPAN)
+            assert abs(current - previous) <= 0.5
+            previous = current
+
+    def test_the_spin_is_antisymmetric_about_its_midpoint(self) -> None:
+        """What makes a second turn mid-spin continuous: the width is the
+        facing times the factor, and a turn flips the facing, so the factor
+        has to flip too for the card to stay where it is."""
+        from tabletop.apps.whack_a_mole import turn_spin_factor
+
+        for i in range(1, 20):
+            remaining = self.SPAN * i / 20
+            assert turn_spin_factor(
+                self.SPAN - remaining, self.SPAN
+            ) == pytest.approx(-turn_spin_factor(remaining, self.SPAN))
+
+    def test_turning_again_mid_spin_does_not_move_the_card(self) -> None:
+        """Cannot happen with one turn per mole, and kept anyway: it is the
+        property that makes the spin safe to retrigger at all."""
+        from tabletop.apps.whack_a_mole import turn_restart_s, turn_spin_factor
+
+        for i in range(1, 20):
+            remaining = self.SPAN * i / 20
+            width_before = turn_spin_factor(remaining, self.SPAN)
+            width_after = -turn_spin_factor(
+                turn_restart_s(remaining, self.SPAN), self.SPAN
+            )
+            assert width_before == pytest.approx(width_after)
+
+    def test_a_turn_from_rest_runs_the_whole_spin(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_restart_s
+
+        assert turn_restart_s(0.0, self.SPAN) == pytest.approx(self.SPAN)
+
+    def test_a_restart_never_asks_for_more_than_a_full_spin(self) -> None:
+        from tabletop.apps.whack_a_mole import turn_restart_s
+
+        for remaining in (-1.0, 0.0, 0.01, self.SPAN, self.SPAN * 2):
+            assert 0.0 <= turn_restart_s(remaining, self.SPAN) <= self.SPAN
+
+
+class TestPopShade:
+    """The dark patch in a hole as a mole passes through its mouth.
+
+    The sprite mole had no shadow at all, so its pop was a pure change of
+    position: nothing said it was coming up out of something. A true cast
+    shadow is wrong for it -- with the light the shaders use, a body 78 mm
+    above the glass casts 52 mm away, outside the 40 mm rim and beside the
+    mound the artwork paints, which reads as a dark blob with no owner. So
+    this sits in the hole and says "occupied" instead.
+    """
+
+    LINGER = 0.16
+
+    def test_a_concealed_mole_makes_the_hole_darkest(self) -> None:
+        """The moment before the pop, which is the point of the cue."""
+        from tabletop.apps.whack_a_mole import POP_SHADE_ALPHA, pop_shade_alpha
+
+        assert pop_shade_alpha(True, 0.0, 0.0, self.LINGER) == pytest.approx(
+            POP_SHADE_ALPHA
+        )
+
+    def test_it_is_gone_by_the_time_the_mole_is_out(self) -> None:
+        """Otherwise it is a smudge under a mole that is standing clear."""
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        assert pop_shade_alpha(True, 1.0, 0.0, self.LINGER) == pytest.approx(0.0)
+
+    def test_it_fades_as_the_mole_rises(self) -> None:
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        values = [pop_shade_alpha(True, i / 10, 0.0, self.LINGER) for i in range(11)]
+        assert values == sorted(values, reverse=True)
+
+    def test_it_comes_back_as_the_mole_drops(self) -> None:
+        """Same function of height, so the retreat is the rise reversed."""
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        assert pop_shade_alpha(True, 0.2, 0.0, self.LINGER) > pop_shade_alpha(
+            True, 0.8, 0.0, self.LINGER
+        )
+
+    def test_it_lingers_after_the_hole_is_empty(self) -> None:
+        """The trailing half of the cue: a retreat should not look like the
+        mole was deleted."""
+        from tabletop.apps.whack_a_mole import POP_SHADE_ALPHA, pop_shade_alpha
+
+        assert pop_shade_alpha(False, 0.0, self.LINGER, self.LINGER) == pytest.approx(
+            POP_SHADE_ALPHA
+        )
+        assert pop_shade_alpha(
+            False, 0.0, self.LINGER / 2, self.LINGER
+        ) == pytest.approx(POP_SHADE_ALPHA / 2)
+
+    def test_an_empty_hole_is_not_shaded_once_the_linger_is_done(self) -> None:
+        """The bug this caught: height 0 means "concealed mole" to the rise
+        and "nothing there" to an empty hole, and reading it the first way
+        left every idle hole on the field permanently dark."""
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        assert pop_shade_alpha(False, 0.0, 0.0, self.LINGER) == 0.0
+
+    def test_the_linger_runs_out(self) -> None:
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        faded = [
+            pop_shade_alpha(False, 0.0, self.LINGER * (1 - i / 10), self.LINGER)
+            for i in range(10)
+        ]
+        assert faded == sorted(faded, reverse=True)
+
+    def test_the_shade_never_exceeds_its_ceiling(self) -> None:
+        from tabletop.apps.whack_a_mole import POP_SHADE_ALPHA, pop_shade_alpha
+
+        for present in (True, False):
+          for height in (-0.5, 0.0, 0.5, 1.0, 1.2):
+            for left in (-0.1, 0.0, 0.08, 0.16, 1.0):
+                alpha = pop_shade_alpha(present, height, left, self.LINGER)
+                assert 0.0 <= alpha <= POP_SHADE_ALPHA
+
+    def test_a_zero_linger_is_not_a_division_by_zero(self) -> None:
+        from tabletop.apps.whack_a_mole import pop_shade_alpha
+
+        assert pop_shade_alpha(False, 0.0, 0.05, 0.0) >= 0.0

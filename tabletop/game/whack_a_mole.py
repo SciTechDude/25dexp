@@ -107,6 +107,28 @@ class GameConfig:
     roughly vertically and only settles into the lean near the top. Leaning
     from the very start looks like it is being poured out sideways."""
 
+    turn_at_fraction: float = 0.4
+    turn_span_fraction: float = 0.2
+    """How a mole's time in view is divided between its two poses.
+
+    Every mole turns to look the other way exactly once, and the schedule
+    is a fraction of the time *that* mole is visible -- the whole of it:
+    the pop out, the stay, and the pop back down
+    (``rise_time_s + up_duration + retract_time_s``). With the defaults
+    that is 40% facing one way, a 20% turn, then 40% facing the other, so
+    the turn is centred and the two poses get equal time whatever the
+    difficulty and wherever in the round's ramp the mole appeared.
+
+    Deriving it from the mole's own span is what makes this work across
+    levels. A fixed probability per second instead meant a fast level
+    usually never turned at all and a slow one turned at an arbitrary
+    moment, often with the turn still running as the mole dropped.
+
+    Keep ``2 * turn_at_fraction + turn_span_fraction == 1.0`` for a
+    symmetric split; a test asserts it of the defaults. Setting
+    ``turn_span_fraction`` to 0 turns the behaviour off.
+    """
+
     rise_time_s: float = 0.11
     """Fast, like a solenoid. Slower than ~150 ms stops reading as mechanical."""
     retract_time_s: float = 0.26
@@ -216,16 +238,24 @@ class HoleView:
     """Normalised 0..1, and may slightly exceed 1 during rise overshoot."""
 
     faces_right: bool = True
-    """Which way this mole is looking, drawn once per spawn.
+    """Which way this mole is looking. Can change while it is out.
 
     Chosen by the rules rather than by the view so it is seeded, and
     therefore stable across a replay and across a headless capture. The view
     has no business inventing state that changes what a frame looks like.
 
-    A coin flip, which is what stops the field from looking like a printed
-    pattern: under the previous rule (flip everything on the right-hand
-    side) every mole in a row faced the same way, and a row of identical
-    poses reads as wallpaper rather than as animals.
+    A coin flip at spawn, which is what stops the field from looking like a
+    printed pattern: under the previous rule (flip everything on the
+    right-hand side) every mole in a row faced the same way, and a row of
+    identical poses reads as wallpaper rather than as animals.
+
+    Every mole then turns in place exactly once, partway through its time
+    in view -- see :attr:`GameConfig.turn_at_fraction`. A mole frozen in
+    the pose it arrived in is what gives away that the field is sprites on
+    sticks; one that looks around reads as deciding something. The flip
+    lands at the *start* of the turn, so a view animating it should take
+    this as the pose being turned toward and ``duration_s`` from the
+    ``turned`` event as how long it has to get there.
     """
 
 
@@ -234,12 +264,17 @@ class GameEvent:
     """Something worth reacting to: sound, particles, HUD flash."""
 
     kind: str
-    """``hit``, ``miss``, ``emerged``, ``escaped``, ``round_over``."""
+    """``hit``, ``miss``, ``emerged``, ``turned``, ``escaped``,
+    ``round_over``."""
     hole_index: int | None = None
     player_id: int | None = None
     points: int = 0
     x_mm: float = 0.0
     y_mm: float = 0.0
+    duration_s: float = 0.0
+    """How long the thing being reported takes, where that is the view's
+    to animate rather than the rules' to simulate. Set for ``turned``, so
+    the spin the view draws lasts exactly the span the rules allotted."""
 
 
 @dataclass
@@ -249,9 +284,26 @@ class _Hole:
     y_mm: float
     state: MoleState = MoleState.DOWN
     elapsed: float = 0.0
+    """Time in the current state. Reset at every state change."""
+    shown_s: float = 0.0
+    """Time since this mole started coming up, across all of its states.
+
+    Separate from :attr:`elapsed` because the turn is scheduled against
+    the whole visible span -- rise, stay and retract -- and ``elapsed``
+    restarts at each phase boundary.
+    """
     up_duration: float = 1.0
     height: float = 0.0
     faces_right: bool = True
+    turned: bool = False
+    """Whether this mole has had its one turn yet.
+
+    The only turn state kept on the hole. *When* it turns and for how long
+    are derived from :attr:`up_duration` and the config every frame (see
+    ``_turn_schedule``) rather than stamped on at spawn, so a mole forced
+    up by hand -- which the headless capture and the tests both do -- turns
+    like any other instead of silently never turning.
+    """
 
 
 class WhackAMole:
@@ -279,7 +331,6 @@ class WhackAMole:
         self.field_height_mm = field_height_mm
         self.player_count = max(1, player_count)
         self._rng = random.Random(seed)
-
         self._holes = self._build_holes()
         self.scores: dict[int, int] = {p: 0 for p in range(self.player_count)}
         self.hits = 0
@@ -399,6 +450,30 @@ class WhackAMole:
                 continue
 
             hole.elapsed += dt
+            hole.shown_s += dt
+
+            # Scheduled against the whole visible span, so it is checked
+            # here rather than inside the UP branch. A struck mole is the
+            # exception: it is being driven back down, and turning to look
+            # around on the way would read as ignoring the hit.
+            turn_at_s, turn_span_s = self._turn_schedule(hole.up_duration)
+            if (
+                not hole.turned
+                and turn_span_s > 0.0
+                and hole.shown_s >= turn_at_s
+                and hole.state is not MoleState.STRUCK
+            ):
+                hole.turned = True
+                hole.faces_right = not hole.faces_right
+                events.append(
+                    GameEvent(
+                        "turned",
+                        hole.index,
+                        x_mm=hole.x_mm,
+                        y_mm=hole.y_mm,
+                        duration_s=turn_span_s,
+                    )
+                )
 
             if hole.state is MoleState.RISING:
                 t = _clamp01(hole.elapsed / max(cfg.rise_time_s, 1e-6))
@@ -566,10 +641,30 @@ class WhackAMole:
         hole = self._rng.choice(candidates)
         hole.state = MoleState.RISING
         hole.elapsed = 0.0
+        hole.shown_s = 0.0
         hole.up_duration = self._ramp(cfg.up_time_start_s, cfg.up_time_end_s)
         hole.faces_right = self._rng.random() < 0.5
+        hole.turned = False
         self.spawned += 1
         return []
+
+    def _turn_schedule(self, up_duration: float) -> tuple[float, float]:
+        """When a mole with this stay turns, and for how long. Seconds.
+
+        Both are fractions of the mole's whole visible span -- the pop out,
+        the stay and the pop back down -- so the two poses get equal time
+        at every difficulty and at every point in the round's ramp. The
+        retract used is the ordinary one: a mole that gets whacked ends its
+        life early, which cannot be known when it is scheduled.
+        """
+        cfg = self.config
+        if cfg.turn_span_fraction <= 0.0:
+            return 0.0, 0.0
+        visible_s = cfg.rise_time_s + up_duration + cfg.retract_time_s
+        return (
+            cfg.turn_at_fraction * visible_s,
+            cfg.turn_span_fraction * visible_s,
+        )
 
     # ------------------------------------------------------------------
     # Rendering interface

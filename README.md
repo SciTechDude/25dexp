@@ -219,6 +219,105 @@ directional light, a tipped-back body and the inward-facing wall of a hole
 both turn away from it entirely and fall back to ambient, so a low value
 renders them near-black with no fill light to rescue them.
 
+### Why the sprite mole gets a pop shade, not a cast shadow
+
+With the sprite, the pop was a **pure change of position**: the card's z
+varied with height and nothing else did — no shadow, no scale change, no
+lean. The only thing saying "rising" was the hole occluding the card, and
+at 0.11 s that reads as a jump rather than as emergence.
+
+A cast shadow is the wrong fix, and trying it is what proved it. Shadows
+here are discs painted on the glass plane, offset along the light by
+`height x light_run`. For a mole 78 mm proud that offset is 52 mm — past
+the 40 mm rim, out on the grass, beside the mound the artwork paints. The
+result is a dark blob with no obvious owner, which is why the sprite path
+had been skipping shadows for so long. Fading it in as it crossed the rim
+only made the blob arrive politely.
+
+What the sprite wants instead is a **pop shade**: a dark disc at the
+hole's own position, inside the rim, darkest while the mole is concealed
+and gone by the time it stands clear. It is a tell that the hole is
+occupied rather than a shadow of a body above it, so it shows in the
+moments before a pop and again as the mole drops back in, then lingers
+0.16 s on an empty hole so a retreat does not look like the mole was
+deleted. The procedural body keeps its real cast shadow — it is a solid,
+and its shadow lands where a solid's does.
+
+`pop_shade_alpha` takes "is there a mole in there" as its own argument,
+which looks redundant next to the height and is not: a mole at the bottom
+of its rise and an empty hole are both height 0, and conflating them left
+every idle hole on the field permanently dark once its linger expired.
+That one came out of logging a full pop frame by frame rather than out of
+a test.
+
+### Why a mole turns while it is standing there
+
+Facing used to be a coin flip at spawn and then frozen for the mole's whole
+life, which is what gives away that a field of sprites is a field of
+sprites: nothing that is alive holds a pose perfectly still. So a mole that
+is out now turns to look the other way now and then.
+
+Every mole turns **exactly once**, on a schedule derived from its own time
+in view: 40% facing one way, a 20% turn, then 40% facing the other
+(`turn_at_fraction`, `turn_span_fraction`). "Time in view" is the whole of
+it — `rise_time_s + up_duration + retract_time_s` — because the mole is
+just as visible popping out and dropping back as it is standing still.
+Scheduling against the stay alone put the turn early and left the second
+pose short by a fifth of the mole's life at medium pace.
+
+Because it is a fraction, difficulty and the round's ramp come out in the
+wash. Nothing in the turn mentions either, and the measured spans fall out
+proportionate anyway:
+
+| level | moles per round | mean life | mean turn |
+|---|---|---|---|
+| beginner | 35 | 2.00 s | 0.41 s |
+| medium | 71 | 1.41 s | 0.28 s |
+| advanced | 117 | 0.91 s | 0.18 s |
+
+The first attempt rolled a probability per second of being up instead
+(a 2 s half-life). It was wrong three ways, and all three were visible:
+at beginner pace moles usually never turned at all, the turn landed at an
+arbitrary moment so the two poses were not symmetric, and the animation
+was a fixed 180 ms stapled onto stays that are three times that at one
+level and half it at another. A schedule needs no randomness, so it also
+draws no numbers from the game's generator — a test asserts the spawn
+sequence a seed produces is identical with turning on and off, and another
+asserts moles-per-round and total time-in-view are untouched per
+difficulty, because decoration that changes the pace is a different level.
+
+The rules own the facing, not the view, so it is seeded and a replay or a
+headless capture shows the same field. *When* a mole turns is recomputed
+from its stay every frame rather than stamped on at spawn, so a mole
+forced up by hand — which the capture scenes and the tests both do — turns
+like any other instead of silently never turning.
+
+The view turns the card by spinning it about its own vertical axis — the
+card has no thickness, so its projected width is `cos(angle)` as the angle
+runs 180° → 0°, passing through zero where it is edge-on. The angle is
+eased (smoothstep), so the turn starts and stops gently and only moves fast
+in the middle where the sprite is too narrow to read. The duration comes
+from the rules, on the `turned` event, rather than from a constant of the
+view's own: there is one answer to how long a turn takes, and it belongs
+with the schedule that sized it. Two details that mattered:
+
+- Events are handled **before** the frame is drawn. Drawing first showed
+  the new pose for one frame and only then began spinning toward it, so a
+  smooth turn had a jump at the front of it.
+- A mole that turns again mid-spin **mirrors the remaining time** rather
+  than restarting. `turn_spin_factor` is antisymmetric about its midpoint,
+  and the facing it multiplies has just changed sign, so the two cancel and
+  the card carries on from exactly the width it was at. Restarting made it
+  jump across the gap it had already closed. A turn reversed just after it
+  began ends immediately, which is correct — the card had barely moved.
+
+**Known, and next on the list here:** the artwork's dirt mound is part of
+the same quad as the mole, so it moves with it — it narrows through the
+turn and it slides up and down with the pop, which is not what a mound of
+earth does. The mound wants to be its own quad, left sitting at the hole
+while the mole moves against it. That is a second quad per hole plus a
+split of the artwork, so it is deferred rather than dismissed.
+
 ### Why taps are hit-tested on the z = 0 plane
 
 Hit testing is done in scene millimetres against the hole footprint at
